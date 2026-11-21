@@ -1,0 +1,8 @@
+home/
+apps/*.tar.zst
+*.key
+*.state
+*.log
+__pycache__/
+*.pyc
+.env

@@ -1,0 +1,19 @@
+[app]
+name = "oh-my-pi"
+version = "19.0.1"
+type = "tool"
+schema_version = "1"
+description = "oh-my-pi omp coding agent CLI - IDE-wired fork of Pi, user-configured provider"
+
+[artifact]
+# Filename 16-hex suffix is the deterministic content-tree hash; sha256 is the compressed .tar.zst digest.
+file = "oh-my-pi-19.0.1-f93076d1a2cb38dc.tar.zst"
+sha256 = "3065ebbf4730797ea009be30c605f14292e622440be124cdabde5d37f960fd00"
+bins = ["omp"]
+version_bin = "omp"
+
+[persist]
+"home/oh-my-pi/omp" = "/root/.omp"
+
+[health]
+command = "omp --version >/dev/null 2>&1 && [ -L /root/.omp/run ] && [ -d /run/omp-runtime ] && [ -w /run/omp-runtime ]"

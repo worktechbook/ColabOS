@@ -1,0 +1,1729 @@
+#!/usr/bin/env python3
+# ============================================================
+#  ColabOS :: svc  v1.1.8
+#  Tiny content-addressed package manager / init for Google
+#  Colab free-tier VMs. One file, no deps beyond Python 3.11+.
+#
+#  Commands: bootstrap | doctor [--fix] | list | status
+#            install <name> [--force] | snapshot <name> [--version V]
+#            logs <name>
+#
+#  v1.1.8 changelog:
+#    - [doc-table] Added doc-table subcommand (and --markdown flag
+#      for status and list) to inspect live manifests, artifact sizes,
+#      content hashes, digests, binaries, and persist mounts, outputting
+#      a standardized Markdown or JSON table directly from system state,
+#      eliminating documentation drift.
+#
+#  v1.1.7 changelog:
+#    - [version-drift] The manifest version must match the version the
+#      installed binary reports. A native updater (`omp update`,
+#      `rustup update`) replaces the binary inside the extracted store
+#      WITHOUT touching the manifest, so the next auto-snapshot packed
+#      the NEW binary under the OLD version string - a mislabeled
+#      artifact that every content-hash check accepted, because the hash
+#      did match the tree; it just described the wrong version. Doctor
+#      now detects the drift and `--fix` re-snapshots under the version
+#      the binary actually reports. The version source is explicit via
+#      `[artifact].version_bin`; multi-binary bundles (devtools) are
+#      skipped rather than guessed.
+#    - [repair-truth] `doctor --fix` no longer reports a failed repair
+#      as "[fix]": repair callbacks propagate the real success flag.
+#    - [repair-store] A corrupted store tree is now reinstallable:
+#      `doctor --fix` re-extracts it (and `svc install --force` forces a
+#      clean re-extract) instead of skipping extraction because the
+#      directory already exists.
+#    - [doctor-lock] `doctor --fix` takes the engine lock, so it cannot
+#      race bootstrap/install/snapshot.
+#    - [atomic-write] Manifest, profile, MOTD and snapshot archives are
+#      written to a temp file and renamed into place. A Drive/FUSE
+#      interruption can no longer truncate the live manifest.
+#    - [probe-timeout] Every manifest health probe is bounded, including
+#      the ones in `install` and `status` (previously unbounded).
+#    - [bin-strict] A manifest-declared binary that cannot be resolved
+#      fails the install instead of being silently skipped. Candidate
+#      resolution is now deterministic (sorted).
+#    - [depends-strict] A missing dependency or a dependency cycle is a
+#      hard error at bootstrap instead of a silent ordering downgrade.
+#    - [snapshot-reconcile] `svc snapshot` now reconciles the live
+#      installation: the store directory is renamed to the new
+#      content-addressed stem, /opt/colabos/<name> is repointed, binaries
+#      are relinked and the lifecycle hook is re-run. Manifest and
+#      installation never diverge after a snapshot.
+#    - [prune-exact] Snapshot pruning is app-scoped and keeps exactly the
+#      current artifact plus one prior artifact.
+#    - [wrapper] The generated wrapper uses the engine's UPDATE_VERBS /
+#      NOOP_FLAGS constants, tracks sub-second mtimes, and no longer
+#      snapshots on a plain `install` subcommand (npm/cargo installs).
+#    - [shell-escape] Manifest env values are shell-quoted before being
+#      written into the generated profile.
+#    - [backup-unique] Persist rescue copies use unique names, so two
+#      rescues in the same second cannot nest into each other.
+#
+#  v1.1.6 changelog:
+#    - [doctor-readonly] `svc doctor` without --fix is now strictly
+#      read-only: repair callbacks only run when --fix is passed.
+#      Previously a failing check triggered install_app() (extract +
+#      lifecycle hook) even on a plain doctor run.
+#    - [depends-on] Bootstrap now installs apps in dependency LEVELS.
+#      A level starts only after every app in the previous level
+#      installed and its lifecycle hook succeeded. The topological sort
+#      was previously discarded by the shared thread pool.
+#    - [artifact-digest] Optional `[artifact].sha256` is verified before
+#      extraction (cold path only) and after extraction the store tree is
+#      re-hashed against the manifest hash. Fails closed.
+#    - [timeouts] All manifest health probes now run with a bounded
+#      timeout so a hung endpoint cannot stall doctor or bootstrap.
+#    - [wrapper-mtime] The auto-snapshot wrapper resolves the real binary
+#      with `type -P` instead of `command -v`; inside the wrapper function
+#      `command -v` returned the function name, so the mtime check was
+#      always empty and could never fire.
+#    - [snapshot-lock] `svc snapshot` now takes the engine lock like
+#      install/bootstrap, so it cannot race another svc operation.
+#    - [bak-cleanup] Persist rescue backups (.bak-<ts>) are pruned to the
+#      newest one per target instead of accumulating forever.
+#    - [version-flag] `svc --version` now works.
+#    - [doctor-hash] `svc doctor` reports content-hash status per app
+#      (read-only check, uses the manifest hash as the expected value).
+#      A tampered or partially-overwritten install is now reported as a
+#      mismatch instead of silently passing. This is the slowest doctor
+#      check: it hashes each store tree (~31 s for the full bundle).
+#    - [doctor-fast-probe] The bootstrap fast path runs a SHALLOW doctor
+#      (deep=False): it skips the content-hash comparison and the full
+#      manifest health commands, and instead does a cheap TCP connect to
+#      each server's exposed port. A dead server is still detected (and
+#      triggers the full bootstrap path), but the warm boot stays at
+#      ~0.08 s instead of ~25 s.
+#    - [bootstrap-levels] Fixed the full-bootstrap path: it unpacked each
+#      dependency level as `(name, cfg)` tuples while install_levels()
+#      yields lists of plain names, raising "ValueError: too many values
+#      to unpack" whenever doctor was not clean.
+#
+#  v1.1.5 changelog:
+#    - Runtime smoke health for tool apps; snapshot retention changed to
+#      current plus one prior artifact; documentation drift corrected.
+#
+#  v1.1.4 changelog:
+#    - [rollback-removed] Rollback feature removed completely
+#      (no `svc rollback`, snapshot keeps only current tarball).
+#      Drive is source of truth; re-snapshot replaces bad updates.
+#    - [toml] devtools.toml persist keys quoted for strict tomllib.
+#    - [wrappers] Fixed APP/app case bug (auto-snapshot now works),
+#      deduped TAILSCALE_HOSTNAME export.
+#  v1.1.3 changelog:
+#    - [rollback] Interactive TTY confirm (skip when not a TTY
+#      or --yes).
+#    - [bootstrap] Fast-path: if doctor passes cleanly on entry,
+#      skip all reinstall/relink work (~50 ms warm).
+#    - [MOTD] Writes /etc/profile.d/colabos-motd.sh that prints
+#      a one-line ColabOS status banner on every SSH login.
+#    - [logs] New `svc logs <name>` command that tails the
+#      service's log file (tailscaled.log for tailscale-ssh).
+#    - [schema-version] TOML [app].schema_version guard;
+#      refuse to load a TOML whose schema_version is newer
+#      than what this engine understands.
+#    - [zstd] Switched snapshot compression to zstd -3 (faster
+#      decompression → faster cold boots; tarballs ~30% larger
+#      but Drive space is free).
+#    - All v1.1.2 fixes retained (noexec-safe /usr/local/bin/svc
+#      shim, realpath-realpath bin comparison, sentinel-aware
+#      lifecycle hook, deterministic tar --sort=name hashes,
+#      auto-generated wrappers with snapshot serialization).
+# ============================================================
+import os, sys, glob, shutil, subprocess, time, argparse, hashlib, fcntl, json, re, socket, shlex, tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION         = "1.1.8"
+SCHEMA_VERSION  = 1                       # engine understands TOML schema <= this
+HEALTH_TIMEOUT  = 20                      # seconds; bounded so a hung probe cannot stall a boot
+ZSTD_COMPRESS   = "-6"                    # tuned: -3 was 30 MiB larger with no cold-boot win (Drive FUSE is the bottleneck, not CPU)
+ZSTD_DECOMPRESS = "-T0"                   # multi-threaded decompress always
+
+BASE            = os.environ.get("COLABOS_BASE", "/content/drive/MyDrive/ColabOS")
+OPT             = "/opt/colabos"
+STORE_OPT       = "/opt/colabos/store"
+BIN_DIR         = "/usr/local/bin"
+PROFILE_D       = "/etc/profile.d/colabos.sh"
+MOTD_D          = "/etc/profile.d/colabos-motd.sh"
+RUN_DIR         = "/run/colabos"
+LOCK_FILE       = os.path.join(RUN_DIR, "colabos.lock")
+WRAP_SNAPSHOT_LOCK = os.path.join(RUN_DIR, "colabos_snapshot.lock")
+
+_RE_NAME    = re.compile(r"^[A-Za-z0-9._-]+$")
+_RE_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RE_BIN     = re.compile(r"^[A-Za-z0-9._+-]+$")
+_RE_SEMVER  = r"\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.\-]+)?"
+
+def _validate_basename(val, label):
+    s = str(val or "")
+    if not s or "/" in s or "\\" in s or s in (".", "..") or not _RE_NAME.match(s):
+        raise ValueError(f"invalid {label}: {val!r}")
+    return s
+
+def _atomic_symlink(src_target, dst_link):
+    parent = os.path.dirname(dst_link) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp_link = os.path.join(parent, f".{os.path.basename(dst_link)}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        os.symlink(src_target, tmp_link)
+        os.replace(tmp_link, dst_link)
+    except Exception:
+        try:
+            if os.path.lexists(tmp_link):
+                os.unlink(tmp_link)
+        except OSError:
+            pass
+        raise
+
+# "install" is deliberately NOT an update verb: `npm install <pkg>` and
+# `cargo install <crate>` are ordinary package installs, not self-updates
+# of the bundled tool, and must not trigger a full app snapshot.
+UPDATE_VERBS = frozenset({"update", "upgrade", "self-update"})
+NOOP_FLAGS   = frozenset({"-h", "--help", "-v", "--version", "--dry-run", "--dryrun",
+                          "--dry", "--report", "--check", "--list", "-l"})
+
+# --------------------------------------------------------------------------- #
+# TOML                                                                         #
+# --------------------------------------------------------------------------- #
+def _strip_inline_comment(line):
+    """Strip a # comment that starts outside any string (respects backslash escapes)."""
+    in_s = None
+    esc = False
+    for i, ch in enumerate(line):
+        if in_s:
+            if esc:
+                esc = False
+            elif ch == "\\" and in_s == '"':
+                esc = True
+            elif ch == in_s:
+                in_s = None
+        elif ch in ('"', "'"):
+            in_s = ch
+        elif ch == '#':
+            return line[:i].rstrip()
+    return line
+
+
+def _parse_scalar(v):
+    if len(v) >= 2 and ((v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'"))):
+        try:
+            # Double-quoted TOML strings share escapes with JSON for our charset.
+            return json.loads(v) if v.startswith('"') else v[1:-1]
+        except Exception:
+            return v[1:-1]
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def _unquote_key(k):
+    k = k.strip()
+    if len(k) >= 2 and ((k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'"))):
+        try:
+            return json.loads(k) if k.startswith('"') else k[1:-1]
+        except Exception:
+            return k[1:-1]
+    return k
+
+
+def load_toml(path):
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (ImportError, ModuleNotFoundError):
+        data, cur = {}, None
+        pending_key = None
+        pending_parts = []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = _strip_inline_comment(raw.strip())
+                if not line:
+                    continue
+                if pending_key is not None:
+                    pending_parts.append(line)
+                    if line.rstrip().endswith("]"):
+                        inner = " ".join(pending_parts)
+                        data[cur][pending_key] = [
+                            _parse_scalar(x.strip()) for x in inner[1:-1].split(",") if x.strip()
+                        ]
+                        pending_key = None
+                        pending_parts = []
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    cur = line[1:-1].strip(); data[cur] = {}
+                elif "=" in line and cur:
+                    k, v = line.split("=", 1)
+                    k, v = _unquote_key(k), v.strip()
+                    if v.startswith("[") and not v.rstrip().endswith("]"):
+                        pending_key = k
+                        pending_parts = [v]
+                        continue
+                    if v.startswith("[") and v.endswith("]"):
+                        data[cur][k] = [
+                            _parse_scalar(x.strip()) for x in v[1:-1].split(",") if x.strip()
+                        ]
+                    else:
+                        data[cur][k] = _parse_scalar(v)
+        return data
+
+
+def _toml_key(k):
+    k = str(k)
+    if re.match(r'^[A-Za-z0-9_-]+$', k):
+        return k
+    return json.dumps(k)
+
+
+def _toml_val(v):
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
+    return json.dumps(str(v))
+
+
+def atomic_write(path, content, mode=0o644):
+    """Write `content` to `path` atomically.
+
+    A Drive/FUSE interruption must never leave a truncated live manifest,
+    profile or MOTD behind. The temp file is created in the SAME directory
+    (so os.replace stays on one filesystem) and renamed into place.
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".colabos-tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+def save_toml(path, cfg):
+    out = []
+    for sec, vals in cfg.items():
+        if not isinstance(vals, dict):
+            raise TypeError(f"TOML section {sec!r} must be a dict")
+        out.append(f"[{sec}]\n")
+        for k, v in vals.items():
+            if isinstance(v, dict):
+                raise TypeError(f"nested TOML table [{sec}.{k}] is not supported by save_toml")
+            out.append(f"{_toml_key(k)} = {_toml_val(v)}\n")
+        out.append("\n")
+    atomic_write(path, "".join(out), mode=0o600)
+
+def check_schema(cfg, name):
+    """Refuse to run if the TOML asks for a schema_version newer than we know."""
+    sv = cfg.get("app", {}).get("schema_version", 1)
+    try:
+        sv = int(sv)
+    except Exception:
+        sv = 1
+    if sv > SCHEMA_VERSION:
+        print(f"ERROR: {name}.toml requires schema_version {sv} but this engine is v{VERSION} (schema {SCHEMA_VERSION}).")
+        print(f"       Upgrade engine/svc before booting; refusing to continue.")
+        return False
+    return True
+
+# --------------------------------------------------------------------------- #
+# Hashing                                                                      #
+# --------------------------------------------------------------------------- #
+def sha16_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def run_health(cmd, timeout=None):
+    """Run a manifest health probe with a bounded timeout.
+
+    Health commands come from TOML and are executed through a shell, so a
+    hung endpoint (or a probe that blocks on stdin) would otherwise stall
+    doctor and bootstrap forever. Returns the CompletedProcess.
+    """
+    try:
+        return subprocess.run(cmd, shell=True, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=(timeout or HEALTH_TIMEOUT))
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, b"", b"health probe timed out")
+
+def verify_artifact_digest(cfg, name, path):
+    """Verify [artifact].sha256 against the tarball. Fails closed.
+
+    The 16-hex in the artifact FILENAME is a hash of the extracted tree
+    (with hash_exclude applied), not of the tarball itself, so it cannot
+    detect a corrupted or tampered download. An explicit `sha256` field in
+    the manifest is the tarball digest and is checked here.
+
+    Returns (ok, message). When no digest is declared, ok=True and the
+    message says so — the check is opt-in per app, not silently skipped.
+    """
+    want = str(cfg.get("artifact", {}).get("sha256", "") or "").strip().lower()
+    if not want:
+        return True, "no digest declared (skipped)"
+    if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
+        return False, f"malformed sha256 in manifest: {want[:16]}..."
+    got = sha256_of_file(path)
+    if got.lower() != want:
+        return False, f"DIGEST MISMATCH expected={want[:16]}... got={got[:16]}..."
+    return True, f"digest ok ({got[:16]}...)"
+
+def hash_excludes(cfg):
+    """Patterns excluded from the content hash (runtime-mutable dirs).
+
+    Apps whose runtime writes into their own install (e.g. a Next.js
+    `.next` route cache) would otherwise never match their artifact hash.
+    The exclusion applies to hashing only - snapshots still archive
+    everything, so a fresh extract stays runnable.
+    """
+    pats = cfg.get("app", {}).get("hash_exclude", [])
+    if isinstance(pats, str):
+        pats = [pats]
+    return [str(p).strip() for p in pats if str(p).strip()]
+
+def sha16_of_dir(path, excludes=None):
+    """Hash a directory tree deterministically.
+
+    tar's exit status is checked: a partial stream must never be hashed
+    and compared as if it were the authoritative content hash.
+    """
+    cmd = ["tar", "-cf", "-", "-C", path, "--sort=name"]
+    for pat in (excludes or []):
+        cmd += ["--exclude", pat]
+    cmd.append(".")
+    with tempfile.TemporaryFile() as err_fh:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh)
+        h = hashlib.sha256()
+        for chunk in iter(lambda: p.stdout.read(1 << 20), b""):
+            h.update(chunk)
+        p.stdout.close()
+        rc = p.wait()
+        err_fh.seek(0)
+        err = err_fh.read().decode("utf-8", "replace")
+    if rc != 0:
+        raise RuntimeError(f"tar failed hashing {path}: {err.strip()}")
+    return h.hexdigest()[:16]
+
+# --------------------------------------------------------------------------- #
+# Discovery                                                                    #
+# --------------------------------------------------------------------------- #
+def get_apps():
+    apps = []
+    adir = os.path.join(BASE, "apps")
+    if not os.path.isdir(adir):
+        return apps
+    for f in sorted(os.listdir(adir)):
+        if f.endswith(".toml"):
+            name = f[:-5]
+            cfg  = load_toml(os.path.join(adir, f))
+            if not check_schema(cfg, name):
+                sys.exit(2)
+            apps.append((name, cfg))
+    return apps
+
+
+def install_order(apps):
+    """Topologically sort apps by `[app].depends_on` (list of app names).
+
+    Apps whose dependencies are missing or not present are treated as
+    independent and never block the boot. Cycles fall back to the original
+    sorted order so a bad manifest can't deadlock startup.
+    """
+    by_name = {name: cfg for name, cfg in apps}
+    indeg = {name: 0 for name, _ in apps}
+    edges = {name: [] for name, _ in apps}
+    for name, cfg in apps:
+        for dep in cfg.get("app", {}).get("depends_on", []) or []:
+            if dep in by_name:
+                edges[dep].append(name)
+                indeg[name] += 1
+    from collections import deque
+    q = deque(sorted(n for n, d in indeg.items() if d == 0))
+    out = []
+    seen = set()
+    while q:
+        n = q.popleft()
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append((n, by_name[n]))
+        for m in sorted(edges[n]):
+            indeg[m] -= 1
+            if indeg[m] <= 0 and m not in seen:
+                q.append(m)
+    if len(out) != len(apps):
+        # Cycle or missing deps: keep original order, never deadlock.
+        return list(apps)
+    return out
+
+def install_levels(apps, strict=False):
+    """Group apps into dependency LEVELS.
+
+    Level 0 = apps with no satisfied dependencies. Level N = apps whose
+    dependencies all live in levels < N. Returns a list of lists.
+
+    Unlike install_order(), this preserves the dependency relationship when
+    the caller installs one level at a time: every app in level N is only
+    started after every app in levels < N has installed and its lifecycle
+    hook has returned successfully.
+
+    With strict=True (the bootstrap path) a missing dependency or a
+    dependency cycle raises ValueError instead of silently downgrading the
+    ordering guarantee. A cycle would otherwise install the cycle members
+    CONCURRENTLY - exactly the ordering violation the level mechanism
+    exists to prevent.
+    """
+    by_name = {name: cfg for name, cfg in apps}
+    deps = {}
+    for name, cfg in apps:
+        raw = list(cfg.get("app", {}).get("depends_on", []) or [])
+        missing = [d for d in raw if d not in by_name]
+        if missing and strict:
+            raise ValueError(
+                f"{name}: depends_on references unknown app(s): {', '.join(sorted(missing))}")
+        deps[name] = [d for d in raw if d in by_name]
+    levels = []
+    done = set()
+    remaining = dict(deps)
+    while remaining:
+        ready = sorted(n for n, d in remaining.items() if all(x in done for x in d))
+        if not ready:
+            if strict:
+                raise ValueError(
+                    "dependency cycle detected among: " + ", ".join(sorted(remaining.keys())))
+            # Non-strict fallback: a single level so a bad manifest can
+            # never deadlock the boot.
+            levels.append(sorted(remaining.keys()))
+            break
+        levels.append(ready)
+        for n in ready:
+            done.add(n)
+            remaining.pop(n, None)
+    return levels
+
+def artifact_path(cfg, name):
+    adir  = os.path.join(BASE, "apps")
+    fname = cfg.get("artifact", {}).get("file")
+    if not fname:
+        return None
+    fname = _validate_basename(fname, "artifact.file")
+    for trydir in (adir, os.path.join(BASE, "store")):
+        p = os.path.join(trydir, fname)
+        if os.path.exists(p):
+            return p
+    return os.path.join(adir, fname)
+
+def store_dir_for(cfg, name):
+    fname = cfg.get("artifact", {}).get("file", "")
+    if not fname:
+        return None
+    fname = _validate_basename(fname, "artifact.file")
+    stem  = fname[:-len(".tar.zst")] if fname.endswith(".tar.zst") else fname
+    return os.path.join(STORE_OPT, stem) if stem else None
+
+# --------------------------------------------------------------------------- #
+# Lock                                                                         #
+# --------------------------------------------------------------------------- #
+def acquire_lock():
+    lock_dir = os.path.dirname(LOCK_FILE) or "/tmp"
+    try:
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    raw_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.fdopen(raw_fd, "r+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[svc] another svc is running; waiting for lock...", flush=True)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+# --------------------------------------------------------------------------- #
+# Shim / Profile / MOTD                                                        #
+# --------------------------------------------------------------------------- #
+def _install_svc_shim():
+    svc_dst = os.path.join(BIN_DIR, "svc")
+    svc_src = os.path.join(BASE, "engine", "svc")
+    shim = "#!/bin/sh\nexec python3 %s \"$@\"\n" % shlex.quote(svc_src)
+    try:
+        atomic_write(svc_dst, shim, mode=0o755)
+        return True
+    except Exception as e:
+        print(f"[svc] warn: could not install shim {svc_dst}: {e}")
+        return False
+
+def write_motd():
+    """One-line ColabOS status printed on every interactive SSH login (sub-50ms, no Drive FUSE)."""
+    motd = f"""# ColabOS MOTD (auto-generated — prints a one-line status banner on interactive shells)
+case "$-" in *i*) ;; *) return ;; esac
+if [ -t 1 ] && [ -z "${{COLABOS_MOTD_SHOWN:-}}" ]; then
+  export COLABOS_MOTD_SHOWN=1
+  _co_h=$(hostname -s 2>/dev/null)
+  _co_t4=""
+  command -v tailscale >/dev/null 2>&1 && {{
+    _co_self=$(timeout 2 tailscale ip -4 2>/dev/null | head -1)
+    _co_st=$(timeout 2 tailscale status 2>/dev/null)
+    _co_peers=$(printf '%s' "$_co_st" | awk 'NR>1 && $1 ~ /^100\\./ && $2 != "Mullvad" {{n++}} END {{print n+0}}')
+    _co_t4=" | tailnet: ${{_co_self:-?}} (${{_co_peers}} peers)"
+  }}
+  _co_up=$(awk '{{printf int($1/60)"m"}}' /proc/uptime 2>/dev/null)
+  _co_nbins=$(ls /usr/local/bin/ 2>/dev/null | wc -l | tr -d ' ')
+  printf "\\033[1;36m[ ColabOS v{VERSION} | %s | %s | up %s | %s bins%s ]\\033[0m\\n" \\
+    "${{_co_h:-?}}" "$(date +%H:%M)" "${{_co_up:-?}}" "${{_co_nbins:-0}}" "${{_co_t4}}"
+  unset _co_h _co_t4 _co_self _co_peers _co_st _co_up _co_nbins
+fi
+"""
+    try:
+        atomic_write(MOTD_D, motd, mode=0o644)
+        return True
+    except Exception as e:
+        print(f"[svc] warn: could not write motd: {e}")
+        return False
+
+def collect_all_bins_and_env():
+    bins = []; envs = {}
+    for name, cfg in get_apps():
+        # Server bins (tailscale/tailscaled) stay symlinked but get no
+        # snapshot wrapper — servers have no update verbs and must not
+        # trigger `svc snapshot` on every invocation.
+        is_server = cfg.get("app", {}).get("type") == "server"
+        if not is_server:
+            for b in cfg.get("artifact", {}).get("bins", []):
+                bins.append((b, name))
+        for k, v in cfg.get("env", {}).items():
+            envs[k] = v
+    seen = set(); out_bins = []
+    for b, app in bins:
+        if b not in seen:
+            seen.add(b); out_bins.append((b, app))
+    return out_bins, envs
+
+def write_profile():
+    """Regenerate /etc/profile.d/colabos.sh (auto-generated shell wrappers)."""
+    bins, envs = collect_all_bins_and_env()
+    safe_bins = []
+    for b, app in bins:
+        if not _RE_BIN.match(str(b)):
+            print(f"[svc] WARN: skipping invalid binary name in profile: {b!r}")
+            continue
+        safe_bins.append((b, app))
+    safe_env_lines = []
+    for k, v in envs.items():
+        if not _RE_ENV_KEY.match(str(k)):
+            print(f"[svc] WARN: skipping invalid env key in profile: {k!r}")
+            continue
+        safe_env_lines.append(f"export {k}={shlex.quote(str(v))}")
+    case_body = "\n".join(f'      {shlex.quote(b)}) app={shlex.quote(app)} ;;' for (b, app) in safe_bins)
+    env_lines = "\n".join(safe_env_lines)
+    path_line = 'export PATH=/usr/local/bin:$PATH'
+    tail_default = '' if 'TAILSCALE_HOSTNAME' in envs else 'export TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-colabos-node}"\n'
+    noop_pat = "|".join(sorted(NOOP_FLAGS))
+    verb_pat = "|".join(f'" {v} "' for v in sorted(UPDATE_VERBS))
+    snap_lock_dir = shlex.quote(os.path.dirname(WRAP_SNAPSHOT_LOCK) or "/tmp")
+    snap_lock = shlex.quote(WRAP_SNAPSHOT_LOCK)
+    contents = f"""# ColabOS profile (auto-generated by `svc bootstrap` - do not hand-edit)
+{path_line}
+{env_lines}
+{tail_default}
+# Generic snapshot-aware wrapper.
+_colabos_wrap() {{
+  local bin="$1"; shift
+  local app=""
+  case "$bin" in
+{case_body}
+      *) app="" ;;
+  esac
+  local cmd=$(type -P -- "$bin" 2>/dev/null || command -v -- "$bin" 2>/dev/null || true)
+  # Follow symlinks (-L) so native updaters modifying the store target are detected.
+  local mt1=""; [ -n "$cmd" ] && [ -e "$cmd" ] && mt1=$(stat -L -c %.9Y "$cmd" 2>/dev/null || stat -L -f %m "$cmd" 2>/dev/null || true)
+  command "$bin" "$@"; local s=$?
+  if [ -z "$app" ]; then return $s; fi
+  local do_snap=0
+  local verb="${{1:-}}"
+  local verb2="${{1:-}} ${{2:-}}"
+  case " $verb " in
+    {verb_pat} )
+      local noop=0
+      for a in "$@"; do
+        case "$a" in
+          {noop_pat}) noop=1 ;;
+        esac
+      done
+      [ $noop -eq 0 ] && [ $s -eq 0 ] && do_snap=1
+      ;;
+  esac
+  if [ $do_snap -eq 0 ] && [ "$verb2" = "self update" ] && [ $s -eq 0 ]; then
+    do_snap=1
+  fi
+  if [ $do_snap -eq 0 ] && [ -n "$mt1" ] && [ -n "$cmd" ] && [ -e "$cmd" ]; then
+    local mt2=$(stat -L -c %.9Y "$cmd" 2>/dev/null || stat -L -f %m "$cmd" 2>/dev/null || true)
+    [ "$mt1" != "$mt2" ] && do_snap=1
+  fi
+  if [ $do_snap -eq 1 ]; then
+    mkdir -p {snap_lock_dir} 2>/dev/null || true
+    (
+      flock -n 9 || exit 0
+      echo "[colabos] snapshot $app"
+      svc snapshot "$app" 2>&1
+    ) 9>{snap_lock}
+  fi
+  return $s
+}}
+"""
+    for b, _ in safe_bins:
+        contents += f"\n{b}() {{ _colabos_wrap {shlex.quote(b)} \"$@\"; }}\n"
+    try:
+        _install_svc_shim()
+        atomic_write(PROFILE_D, contents, mode=0o644)
+        write_motd()
+        print(f"[svc] wrote profile with {len(safe_bins)} wrapper(s) -> {PROFILE_D}")
+        return True
+    except Exception as e:
+        print(f"[svc] warn: could not write profile {PROFILE_D}: {e}")
+        return False
+
+# --------------------------------------------------------------------------- #
+# Bin resolver                                                                 #
+# --------------------------------------------------------------------------- #
+def find_bin(live_link, b):
+    """Resolve a declared binary inside a store tree.
+
+    Candidates are sorted so the result is deterministic when several
+    matches exist at the same depth (glob order is filesystem-dependent).
+    """
+    for depth in range(4):
+        cands = sorted(glob.glob(os.path.join(live_link, "*/"*depth, "bin", b)))
+        for c in cands:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    return None
+
+# --------------------------------------------------------------------------- #
+# Install                                                                      #
+# --------------------------------------------------------------------------- #
+def install_app(name, *, quiet=False, force=False):
+    """Install one app from its Drive artifact.
+
+    force=True re-extracts the artifact even when the store directory
+    already exists. This is the repair path for a corrupted or
+    tampered store: without it, a corrupted tree can never be healed.
+    """
+    def log(*a):
+        if not quiet: print(*a, flush=True)
+    try:
+        _validate_basename(name, "app name")
+    except ValueError as e:
+        log(f"ERROR: {e}"); return False
+    cfg_path = os.path.join(BASE, "apps", f"{name}.toml")
+    if not os.path.exists(cfg_path):
+        log(f"ERROR: {cfg_path} not found"); return False
+    cfg = load_toml(cfg_path)
+    if not check_schema(cfg, name): return False
+    src = artifact_path(cfg, name)
+    if not src or not os.path.exists(src):
+        log(f"ERROR: artifact missing for {name} (expected {src})"); return False
+
+    # [artifact-digest] Verify the tarball digest BEFORE extracting it.
+    # The 16-hex in the filename hashes the extracted tree, not the
+    # tarball, so it cannot detect a corrupted or tampered download.
+    # Fails closed: a mismatch aborts the install.
+    ok, msg = verify_artifact_digest(cfg, name, src)
+    if not ok:
+        log(f"ERROR: {name} artifact digest verification failed: {msg}")
+        return False
+    if not msg.startswith("no digest"):
+        log(f"[svc] digest {name}: {msg}")
+
+    target_store = store_dir_for(cfg, name)
+    live_link   = os.path.join(OPT, name)
+    os.makedirs(STORE_OPT, exist_ok=True)
+    os.makedirs(OPT, exist_ok=True)
+
+    # Cold extract (or forced re-extract).
+    if target_store and (force or not os.path.exists(target_store)):
+        tmp = target_store + ".tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp, exist_ok=True)
+        size_mb = os.path.getsize(src) / (1024*1024)
+        log(f"[svc] extract {os.path.basename(src)} ({size_mb:.0f} MiB) -> {target_store}")
+        t0 = time.time()
+        res = subprocess.run(["tar", "--no-same-owner", "-I", f"zstd {ZSTD_DECOMPRESS}", "-xf", src, "-C", tmp])
+        if res.returncode != 0:
+            log(f"ERROR: extract failed for {src}")
+            shutil.rmtree(tmp, ignore_errors=True); return False
+        # [artifact-digest] Verify the freshly extracted tree against the
+        # manifest hash (which is computed with hash_exclude applied). This
+        # catches a tarball whose contents do not match the hash in its name.
+        #
+        # [chmod-before-hash] The content hash covers tar metadata, which
+        # includes the file mode. The declared binaries are chmod'ed to
+        # 0755 BEFORE the tree is hashed, so an archived 0644 binary does
+        # not produce a hash mismatch on the next doctor run.
+        for b in cfg.get("artifact", {}).get("bins", []):
+            if not _RE_BIN.match(str(b)):
+                log(f"ERROR: invalid binary name {b!r} in {name}.toml")
+                shutil.rmtree(tmp, ignore_errors=True); return False
+            for depth in range(4):
+                for c in sorted(glob.glob(os.path.join(tmp, "*/"*depth, "bin", b))):
+                    if os.path.isfile(c):
+                        try: os.chmod(c, 0o755)
+                        except OSError: pass
+        expected = os.path.basename(target_store).rsplit("-", 1)[-1]
+        try:
+            actual = sha16_of_dir(tmp, hash_excludes(cfg))
+        except RuntimeError as e:
+            log(f"ERROR: {name} could not hash extracted tree: {e}")
+            shutil.rmtree(tmp, ignore_errors=True); return False
+        if expected and actual != expected:
+            log(f"ERROR: {name} extracted tree hash mismatch (expected {expected}, got {actual})")
+            shutil.rmtree(tmp, ignore_errors=True); return False
+        # [atomic-store] Swap the freshly verified tree into place. The
+        # old directory is removed only after the new one is in place, so
+        # a failed extraction never destroys a working install.
+        if os.path.exists(target_store):
+            stale = target_store + ".stale"
+            shutil.rmtree(stale, ignore_errors=True)
+            os.rename(target_store, stale)
+            try:
+                os.rename(tmp, target_store)
+            except Exception:
+                os.rename(stale, target_store)   # restore the old tree
+                raise
+            shutil.rmtree(stale, ignore_errors=True)
+        else:
+            os.rename(tmp, target_store)
+        log(f"[svc] extracted in {time.time()-t0:.1f}s")
+
+    # Live symlink (atomic swap when replacing a symlink)
+    if target_store:
+        try:
+            if os.path.exists(live_link) and not os.path.islink(live_link):
+                shutil.rmtree(live_link)
+            _atomic_symlink(target_store, live_link)
+        except Exception as e:
+            log(f"ERROR: cannot replace {live_link}: {e}"); return False
+
+    # Bins
+    bins = cfg.get("artifact", {}).get("bins", [])
+    for b in bins:
+        if not _RE_BIN.match(str(b)):
+            log(f"ERROR: invalid binary name {b!r} in {name}.toml")
+            return False
+        srcb = find_bin(live_link, b)
+        if not srcb:
+            log(f"ERROR: declared binary '{b}' not found in {live_link}")
+            return False
+        try: os.chmod(srcb, 0o755)
+        except OSError: pass
+        dst = os.path.join(BIN_DIR, b)
+        try:
+            _atomic_symlink(srcb, dst)
+            log(f"[svc] link /usr/local/bin/{b} -> {srcb}")
+        except Exception as e:
+            log(f"ERROR: link {b} failed: {e}"); return False
+
+    # Persist
+    persist = cfg.get("persist", {})
+    for src_rel, dst_path in persist.items():
+        src_abs = os.path.join(BASE, src_rel)
+        try: os.makedirs(src_abs, exist_ok=True)
+        except Exception as e:
+            log(f"ERROR: cannot mkdir {src_abs}: {e}"); return False
+        dst_exp = os.path.expanduser(dst_path)
+        try: os.makedirs(os.path.dirname(dst_exp), exist_ok=True)
+        except Exception as e:
+            log(f"ERROR: cannot mkdir parent of {dst_exp}: {e}"); return False
+        if os.path.exists(dst_exp) and not os.path.islink(dst_exp):
+            # [backup-unique] Second-resolution names could collide (two
+            # rescues in the same second) and nest one copy inside the
+            # other. Use a unique suffix so every rescue is independent.
+            bak = f"{dst_exp}.bak-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+            n = 0
+            while os.path.exists(bak):
+                n += 1
+                bak = f"{dst_exp}.bak-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.{n}"
+            try: shutil.move(dst_exp, bak)
+            except Exception as e:
+                log(f"ERROR: rescue {dst_exp} -> {bak} failed: {e}"); return False
+            log(f"[svc] rescue {dst_exp} -> {bak}")
+            # [bak-cleanup] Keep only the newest rescue copy per target so
+            # repeated installs cannot grow the Drive footprint forever.
+            try:
+                olds = sorted(glob.glob(f"{dst_exp}.bak-*"), key=os.path.getmtime)
+                for o in olds[:-1]:
+                    if os.path.isdir(o) and not os.path.islink(o): shutil.rmtree(o, ignore_errors=True)
+                    else: os.remove(o)
+                    log(f"[svc] prune old rescue {o}")
+            except Exception as e:
+                log(f"[svc] warn: rescue cleanup failed for {dst_exp}: {e}")
+        elif os.path.islink(dst_exp):
+            try: os.remove(dst_exp)
+            except OSError: pass
+        try:
+            os.symlink(src_abs, dst_exp)
+            log(f"[svc] persist {dst_exp} -> {src_abs}")
+        except Exception as e:
+            log(f"ERROR: persist symlink {dst_exp} -> {src_abs} failed: {e}"); return False
+
+    # Lifecycle hook: setup script runs for ALL app types (tool/cli/server)
+    # [setup-hook-patch] generalized for all app types
+    setup = os.path.join(BASE, "apps", f"{name}.sh")
+    if not os.path.exists(setup):
+        setup = os.path.join(BASE, "apps", "setup_" + name + ".sh")
+    if os.path.exists(setup):
+        log(f"[svc] setup {name}")
+        t_setup = time.time()
+        res = subprocess.run(["bash", setup])
+        if res.returncode != 0:
+            log(f"ERROR: lifecycle hook for {name} exited {res.returncode}")
+            return False
+        log(f"[svc] setup {name} ok ({time.time()-t_setup:.1f}s)")
+
+    # Server-only auto-start + tailscale serve/funnel.
+    # Only fires when (a) type=="server", (b) no custom setup script
+    # already took responsibility for starting the daemon, (c) binary exists.
+    has_setup = (os.path.exists(os.path.join(BASE, "apps", f"{name}.sh"))
+                 or os.path.exists(os.path.join(BASE, "apps", "setup_" + name + ".sh")))
+    if cfg.get("app", {}).get("type") == "server" and not has_setup:
+        expose = cfg.get("expose", {})
+        bin_path = os.path.join(live_link, "bin", name)
+        if not os.path.exists(bin_path):
+            bin_path = os.path.join(OPT, name, "bin", name)
+        port = str(expose.get("port", ""))
+        mode = expose.get("mode", "none")
+        health = expose.get("health", "")
+        if port and os.path.exists(bin_path):
+            healthy = False
+            if health:
+                r = run_health(health)
+                healthy = (r.returncode == 0)
+            if not healthy:
+                log(f"[svc] start {name} on :{port} mode {mode}")
+                subprocess.Popen(
+                    ["bash", "-c",
+                     f"setsid nohup {shlex.quote(bin_path)} > /tmp/{shlex.quote(name)}.log 2>&1 < /dev/null &"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(2)
+            if mode in ("tailnet", "funnel") and shutil.which("tailscale"):
+                if mode == "funnel":
+                    subprocess.run(["tailscale", "funnel", "--bg", port],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.run(["tailscale", "serve", "--bg", "--tcp", port,
+                                    f"tcp://127.0.0.1:{port}"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+# --------------------------------------------------------------------------- #
+# Doctor                                                                       #
+# --------------------------------------------------------------------------- #
+def _svc_shim_ok():
+    svc_dst = os.path.join(BIN_DIR, "svc")
+    svc_src = os.path.join(BASE, "engine", "svc")
+    if not os.path.exists(svc_dst) or not os.access(svc_dst, os.X_OK): return False
+    if os.path.islink(svc_dst): return False
+    try:
+        with open(svc_dst, "r", encoding="utf-8") as f:
+            head = f.read(256)
+    except Exception:
+        return False
+    return "python3" in head and svc_src in head
+
+def _bin_ok(cfg, name, b):
+    live_link = os.path.join(OPT, name)
+    dst = os.path.join(BIN_DIR, b)
+    expected = find_bin(live_link, b)
+    if not expected: return False
+    if not (os.path.islink(dst) and os.path.exists(dst)): return False
+    return os.path.realpath(dst) == os.path.realpath(expected)
+
+def _persist_ok(cfg, name):
+    ok = True
+    for src_rel, dst_path in cfg.get("persist", {}).items():
+        src_abs = os.path.join(BASE, src_rel)
+        dst_exp = os.path.expanduser(dst_path)
+        # Compare canonical paths on BOTH sides: the declared Drive source
+        # may itself be a symlink, and comparing a canonical target against
+        # a non-canonical source produced a permanent doctor failure.
+        if not (os.path.islink(dst_exp)
+                and os.path.realpath(dst_exp) == os.path.realpath(src_abs)):
+            ok = False
+    return ok
+
+def port_listening(port, host="127.0.0.1", timeout=1.0):
+    """True if something accepts a TCP connection on host:port.
+
+    Used by the bootstrap fast path as a cheap liveness probe. The full
+    manifest health commands are far more expensive (they run every tool
+    binary's --version and, for servers, reach the public URL),
+    and they must not sit on the warm-boot hot path.
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _unix_socket_listening(sock_path, timeout=1.0):
+    """True if a local Unix domain socket exists and accepts a connection."""
+    if not sock_path or not os.path.exists(sock_path):
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(sock_path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def detect_binary_version(cfg, name):
+    """Ask the installed binary for its own version string.
+
+    [version-drift] A native updater (`omp update`, `rustup update`, ...)
+    replaces the binary inside the extracted store WITHOUT touching the
+    manifest. The next auto-snapshot then packs the NEW binary under the
+    OLD version string, producing a mislabeled artifact that every
+    content-hash check happily accepts - the hash matches the tree, it
+    just describes the wrong version.
+
+    The version source must be unambiguous:
+      - `[artifact].version_bin` names the binary that carries the app
+        version (explicit, preferred);
+      - otherwise a single-bin app uses that bin;
+      - otherwise (a bundle of several binaries, e.g. devtools, whose app
+        version `1.0.0` matches no individual tool) no version source
+        exists and the check is skipped rather than guessing.
+
+    Returns the version string the binary reports, or None when it cannot
+    be determined.
+    """
+    bins = cfg.get("artifact", {}).get("bins", []) or []
+    if not bins:
+        return None
+    want = cfg.get("artifact", {}).get("version_bin")
+    if want:
+        candidates = [want]
+    elif len(bins) == 1:
+        candidates = list(bins)
+    else:
+        # Multi-binary bundle: the app version describes the bundle, not
+        # any one tool. Guessing here would produce false drift reports.
+        return None
+    live = os.path.join(OPT, name)
+    if not os.path.exists(live):
+        return None
+    for b in candidates:
+        path = find_bin(live, b)
+        if not path:
+            continue
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True,
+                               text=True, timeout=HEALTH_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode != 0:
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        for tok in out.replace("/", " ").replace(",", " ").split():
+            cand = tok[1:] if tok.startswith(("v", "V")) and len(tok) > 1 and tok[1].isdigit() else tok
+            if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?", cand):
+                return cand
+    return None
+
+
+def cmd_doctor(args):
+    fix = args.fix
+    # [doctor-lock] `doctor --fix` mutates the store, /usr/local/bin and the
+    # persist symlinks. Taking the engine lock prevents it from racing a
+    # concurrent bootstrap/install/snapshot.
+    lock_fd = None
+    if fix:
+        lock_fd = acquire_lock()
+    try:
+      deep = getattr(args, "deep", True)
+      unfixed = 0
+      results = []
+      repaired_apps = set()
+      def _repair_install_once(n, force=False):
+          if not force and n in repaired_apps:
+              return True
+          ok = install_app(n, quiet=False, force=force)
+          if ok:
+              repaired_apps.add(n)
+          return ok
+      def chk(label, cond, repair=None):
+          nonlocal unfixed
+          if cond:
+              results.append(("OK", label)); return True
+          results.append(("!!", label))
+          if fix and repair is not None:
+              try:
+                  fixed = bool(repair())
+                  if fixed:
+                      results[-1] = ("FIX", label + " (fixed)")
+                      return True
+                  else:
+                      results[-1] = ("ERR", label + " (repair failed)")
+              except Exception as e:
+                  results[-1] = ("ERR", f"fix failed for {label}: {e}")
+          unfixed += 1
+          return False
+
+      chk(f"Drive {BASE}", os.path.isdir(BASE))
+      zstd = shutil.which("zstd")
+      chk("zstd", bool(zstd),
+          repair=lambda: (not subprocess.run(["apt-get","update","-qq"]).returncode
+                       and not subprocess.run(["apt-get","install","-y","-qq","zstd"]).returncode))
+
+      chk(f"svc shim {os.path.join(BIN_DIR,'svc')} -> python3 engine/svc",
+          _svc_shim_ok(), repair=_install_svc_shim)
+      chk(f"profile {PROFILE_D}", os.path.exists(PROFILE_D),
+          repair=write_profile)
+      chk(f"motd {MOTD_D}", os.path.exists(MOTD_D),
+          repair=write_motd)
+
+      all_apps = get_apps()
+      by_name = {n: c for n, c in all_apps}
+      ordered_names = [n for lvl in install_levels(all_apps, strict=False) for n in lvl]
+      for name in ordered_names:
+          cfg = by_name[name]
+          ver = cfg.get("app", {}).get("version", "?")
+          src_tar = artifact_path(cfg, name)
+          chk(f"{name} v{ver} tarball {os.path.basename(src_tar) if src_tar else 'MISSING'}",
+              bool(src_tar) and os.path.exists(src_tar))
+          declared = str(cfg.get("artifact", {}).get("sha256", "") or "").strip()
+          if declared:
+              chk(f"{name} v{ver} artifact digest declared",
+                  len(declared) == 64 and all(c in "0123456789abcdefABCDEF" for c in declared))
+          sdir = store_dir_for(cfg, name)
+          chk(f"{name} v{ver} extracted at {sdir}",
+              bool(sdir) and os.path.isdir(sdir),
+              repair=lambda n=name: _repair_install_once(n, force=False))
+          live = os.path.join(OPT, name)
+          detected = detect_binary_version(cfg, name)
+          has_drift = bool(detected and ver != "?" and detected != ver)
+          if has_drift:
+              def _repair_drift(n=name, want=detected):
+                  # Snapshot the LIVE updated binary directly under its reported version
+                  # (never re-extract the old tarball first, which would destroy the update).
+                  return _snapshot_with_version(n, want)
+              if chk(f"{name} version drift: manifest {ver} but binary reports {detected}",
+                     False, repair=_repair_drift):
+                  # Reload manifest/paths after snapshot reconciled the live store.
+                  cfg_p = os.path.join(BASE, "apps", f"{name}.toml")
+                  if os.path.exists(cfg_p):
+                      cfg = load_toml(cfg_p)
+                      ver = cfg.get("app", {}).get("version", ver)
+                      sdir = store_dir_for(cfg, name)
+                  has_drift = False
+          if deep and sdir and os.path.isdir(sdir):
+              expected = os.path.basename(sdir).rsplit("-", 1)[-1]
+              try:
+                  actual = sha16_of_dir(sdir, hash_excludes(cfg))
+              except RuntimeError as e:
+                  actual = f"ERROR({e})"
+              # Never force-reinstall the old tarball while version drift is unresolved.
+              hash_repair = None if has_drift else (lambda n=name: _repair_install_once(n, force=True))
+              chk(f"{name} v{ver} content hash {actual} (expected {expected})",
+                  actual == expected,
+                  repair=hash_repair)
+          link_ok = bool(sdir) and os.path.islink(live) and os.path.realpath(live) == os.path.realpath(sdir)
+          chk(f"{name} v{ver} symlink {live}", link_ok,
+              repair=lambda n=name: _repair_install_once(n, force=False))
+          for b in cfg.get("artifact", {}).get("bins", []):
+              chk(f"{name}: bin {os.path.join(BIN_DIR,b)}", _bin_ok(cfg, name, b),
+                  repair=lambda n=name: _repair_install_once(n, force=False))
+          for src_rel, dst_path in cfg.get("persist", {}).items():
+              src_abs = os.path.join(BASE, src_rel)
+              dst_exp = os.path.expanduser(dst_path)
+              chk(f"persist {dst_exp} -> {src_rel}",
+                  os.path.islink(dst_exp) and os.path.exists(dst_exp)
+                  and os.path.realpath(dst_exp) == os.path.realpath(src_abs),
+                  repair=lambda n=name: _repair_install_once(n, force=False))
+        # [doctor-fast-probe] On the shallow (bootstrap fast-path) run,
+        # the full manifest health commands are replaced by a cheap TCP
+        # connect to the exposed port. The full commands run every tool
+        # binary's --version and, for servers, reach the public URL
+        # URL - together several seconds, which does not belong on the
+        # warm-boot hot path. A server whose port is closed is still
+        # detected here, which is what the fast path needs to decide
+        # whether to reinstall.
+        #
+        # Tool apps (no exposed port) get no runtime probe at all on the
+        # shallow path: their binaries are already verified structurally
+        # by the `bins[]` symlink checks above, and invoking 20 binaries
+        # just to print their versions is pure warm-boot cost.
+          app_health = cfg.get("health", {}).get("command")
+          expose_health = cfg.get("expose", {}).get("health")
+          expose_port = cfg.get("expose", {}).get("port")
+          if not deep:
+              if cfg.get("app", {}).get("type") == "server" and expose_port:
+                  fast_ok = port_listening(expose_port)
+                  if cfg.get("expose", {}).get("mode") == "tailnet":
+                      fast_ok = fast_ok and _unix_socket_listening("/var/run/tailscale/tailscaled.sock")
+                  chk(f"{name}: runtime health (port {expose_port})", fast_ok)
+          else:
+              if app_health:
+                  r = run_health(app_health)
+                  chk(f"{name}: runtime health", r.returncode == 0,
+                      repair=lambda n=name: _repair_install_once(n, force=False))
+              if expose_health:
+                  r = run_health(expose_health)
+                  chk(f"  health: {expose_health}", r.returncode == 0,
+                      repair=lambda n=name: _repair_install_once(n, force=False))
+
+      if fix:
+          write_profile()
+
+      print("== ColabOS Doctor ==")
+      for st, label in results:
+          tag = {"OK":"[OK]","!!":"[!!]","FIX":"[fix]","ERR":"[ERR]"}[st]
+          print(f"  {tag} {label}")
+      globals()["LAST_DOCTOR_RESULTS"] = list(results)
+      ok_all = (unfixed == 0)
+      if ok_all:
+          if fix and any(st == "FIX" for st, _ in results):
+              print("ALL CHECKS PASSED (Healed)")
+          else:
+              print("ALL CHECKS PASSED (Healthy)")
+      else:
+          print("ISSUES FOUND — run `svc doctor --fix` to auto-heal.")
+      return ok_all
+    finally:
+      if lock_fd is not None:
+          try: fcntl.flock(lock_fd, fcntl.LOCK_UN)
+          except Exception: pass
+          lock_fd.close()
+
+# --------------------------------------------------------------------------- #
+# List / Status / Logs                                                         #
+# --------------------------------------------------------------------------- #
+def cmd_doc_table(args=None):
+    """Output Markdown (or JSON) table of all apps from live manifests and artifacts."""
+    as_json = getattr(args, "json", False) if args else False
+    apps = get_apps()
+    rows = []
+    for name, cfg in apps:
+        app_sec = cfg.get("app", {})
+        art_sec = cfg.get("artifact", {})
+        ver = app_sec.get("version", "?")
+        typ = app_sec.get("type", "?")
+        art_file = art_sec.get("file", "-")
+        art_sha = art_sec.get("sha256", "-")
+        bins = ", ".join(art_sec.get("bins", [])) or "-"
+        persists = ", ".join(cfg.get("persist", {}).values()) or "-"
+
+        art_p = artifact_path(cfg, name)
+        size_str = "-"
+        sz_bytes = 0
+        if art_p and os.path.exists(art_p):
+            sz_bytes = os.path.getsize(art_p)
+            size_str = _human_size(sz_bytes)
+
+        sdir = store_dir_for(cfg, name)
+        h = (sdir or "").split("-")[-1] if sdir else "-"
+        rows.append({
+            "name": name,
+            "version": ver,
+            "type": typ,
+            "artifact": art_file,
+            "size": size_str,
+            "size_bytes": sz_bytes,
+            "hash": h,
+            "sha256": art_sha,
+            "bins": bins,
+            "persist": persists,
+        })
+
+    if as_json:
+        out = json.dumps(rows, indent=2)
+        print(out)
+        return out
+
+    headers = ["App", "Version", "Type", "Artifact File", "Size", "Content Hash", "Tarball Digest (SHA-256)", "Binaries", "Persist Mounts"]
+    lines = []
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join([":---"] * len(headers)) + " |")
+    for r in rows:
+        sha_display = f"{r['sha256'][:16]}..." if len(r['sha256']) == 64 else f"{r['sha256']}"
+        lines.append(f"| {r['name']} | {r['version']} | {r['type']} | {r['artifact']} | {r['size']} | {r['hash']} | {sha_display} | {r['bins']} | {r['persist']} |")
+    out = "\n".join(lines)
+    print(out)
+    return out
+
+def cmd_list(args):
+    if getattr(args, "markdown", False):
+        return cmd_doc_table(args)
+    print(f"ColabOS v{VERSION} Apps (Drive: {BASE})")
+    print("-"*100)
+    print(f"{'NAME':<18} | {'TYPE':<8} | {'VERSION':<8} | {'MODE':<9} | {'HASH':<16} | {'STATUS':<10}")
+    print("-"*100)
+    for name, cfg in get_apps():
+        ver  = cfg.get("app",{}).get("version","?")
+        typ  = cfg.get("app",{}).get("type","?")
+        mode = cfg.get("expose",{}).get("mode","-")
+        sdir = store_dir_for(cfg, name)
+        h = (sdir or "").split("-")[-1] if sdir else "-"
+        status = "installed" if sdir and os.path.isdir(sdir) else "not installed"
+        print(f"{name:<18} | {typ:<8} | {ver:<8} | {mode:<9} | {h:<16} | {status:<10}")
+    print("-"*100)
+
+def _human_size(n):
+    for u in ("B","KiB","MiB","GiB"):
+        if n < 1024: return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+def _persist_size(src_abs, max_entries=2000):
+    """Best-effort size of a persisted tree, bounded in time and entries.
+
+    `svc status` must stay fast. A full walk over Drive FUSE of the OMP
+    state (plugins, Chromium, npm cache) took over ten minutes. Walk at
+    most `max_entries` files and report whether the result is partial.
+    """
+    if not os.path.isdir(src_abs):
+        return "missing"
+    total = 0
+    count = 0
+    truncated = False
+    for dp, dns, fns in os.walk(src_abs):
+        for fn in fns:
+            if count >= max_entries:
+                truncated = True
+                break
+            try:
+                total += os.path.getsize(os.path.join(dp, fn))
+                count += 1
+            except OSError:
+                pass
+        if truncated:
+            break
+    size = _human_size(total)
+    return f">= {size} (partial)" if truncated else size
+
+def cmd_status(args):
+    if getattr(args, "markdown", False):
+        return cmd_doc_table(args)
+    target = args.name
+    found = False
+    for name, cfg in get_apps():
+        if target and name != target: continue
+        found = True
+        print(f"--- {name} ---")
+        print(f"  type      : {cfg.get('app',{}).get('type','?')}")
+        print(f"  version   : {cfg.get('app',{}).get('version','?')}")
+        tar = artifact_path(cfg, name)
+        if tar and os.path.exists(tar):
+            print(f"  artifact  : {os.path.basename(tar)}  ({os.path.getsize(tar)/(1024*1024):.1f} MiB)")
+        sdir = store_dir_for(cfg, name)
+        print(f"  installed : {'yes' if sdir and os.path.isdir(sdir) else 'no'}")
+        live = os.path.join(OPT, name)
+        if os.path.islink(live):
+            print(f"  live link : {live} -> {os.readlink(live)}")
+        print(f"  bins      : {', '.join(cfg.get('artifact',{}).get('bins',[]))}")
+        if sdir:
+            expected = os.path.basename(sdir).rsplit("-", 1)[-1]
+            try:
+                actual = sha16_of_dir(sdir, hash_excludes(cfg)) if os.path.isdir(sdir) else "-"
+            except RuntimeError as e:
+                actual = f"ERROR({e})"
+            print(f"  hash      : {actual} (expected {expected}) {'OK' if actual==expected else 'MISMATCH'}")
+        expose = cfg.get("expose",{})
+        if expose:
+            mode = expose.get("mode","-"); port = expose.get("port","")
+            h = expose.get("health","")
+            ok = False
+            if h:
+                # [probe-timeout] Bounded, like every other manifest probe.
+                r = run_health(h)
+                ok = (r.returncode == 0)
+            print(f"  expose    : {mode} :{port} health={'ok' if ok else 'down'}")
+        for src_rel, dst_path in cfg.get("persist",{}).items():
+            src_abs = os.path.join(BASE, src_rel); dst_exp = os.path.expanduser(dst_path)
+            # [status-size] The persisted tree can hold hundreds of MB of
+            # npm cache, OMP plugins and a Chromium download. Walking it
+            # file-by-file over Drive FUSE made `svc status` take minutes
+            # (observed: >600 s). Report the size only when it is cheap to
+            # obtain, and never block the command.
+            print(f"  persist   : {dst_exp} <- {src_rel}  ({_persist_size(src_abs)})")
+        app_h = cfg.get("health", {}).get("command", "")
+        if app_h:
+            r = run_health(app_h)
+            print(f"  health    : {'ok' if r.returncode == 0 else 'down'}")
+        print()
+    if target and not found:
+        print(f"ERROR: unknown app '{target}'")
+        sys.exit(1)
+
+def _log_paths_for(name, cfg):
+    """Return a list of candidate log files for a service."""
+    cands = []
+    # Convention: /tmp/<name>.log for generic servers
+    cands.append(f"/tmp/{name}.log")
+    # Known per-service conventions
+    if name == "tailscale-ssh":
+        cands.append("/var/log/tailscaled.log")
+        cands.append(os.path.join(BASE, "home/tailscale-ssh/tailscale/tailscaled.log"))
+    # [app] log key if declared (safe token substitution, no str.format)
+    log_key = cfg.get("app",{}).get("log","")
+    if log_key:
+        cands.append(str(log_key).replace("{base}", BASE).replace("{opt}", OPT).replace("{name}", name))
+    return [p for p in cands if os.path.exists(p)]
+
+def cmd_logs(args):
+    name = args.name
+    cfg_path = os.path.join(BASE, "apps", f"{name}.toml")
+    if not os.path.exists(cfg_path):
+        print(f"ERROR {cfg_path}"); sys.exit(1)
+    cfg = load_toml(cfg_path)
+    logs = _log_paths_for(name, cfg)
+    if not logs:
+        print(f"[logs] no log files found for {name}.")
+        # Generic servers log to /tmp/<name>.log; tailscaled logs to its persist dir.
+        print(f"       expected locations: /tmp/{name}.log, plus any [app].log path in TOML.")
+        sys.exit(0)
+    follow = [] if args.no_follow else ["-f"]
+    n = ["-n", str(args.lines)]
+    cmd = ["tail"] + n + follow + ["--"] + logs
+    print(f"[logs] tailing {', '.join(logs)} (Ctrl-C to stop)")
+    os.execvp("tail", cmd)
+
+# --------------------------------------------------------------------------- #
+# Install / Snapshot                                                          #
+# --------------------------------------------------------------------------- #
+def cmd_install(args):
+    fd = acquire_lock()
+    try:
+        if not install_app(args.name, quiet=False, force=getattr(args, "force", False)):
+            sys.exit(1)
+        write_profile()
+    finally:
+        try: fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError: pass
+        fd.close()
+
+def cmd_snapshot(args):
+    fd = acquire_lock()
+    try:
+        if not _cmd_snapshot_locked(args):
+            sys.exit(1)
+    finally:
+        try: fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError: pass
+        fd.close()
+
+def _snapshot_with_version(name, version):
+    """Snapshot an app under an explicit version, without taking the lock."""
+    args = argparse.Namespace(name=name, version=version)
+    return bool(_cmd_snapshot_locked(args))
+
+
+def _artifact_files(name):
+    """Return this app's artifact filenames, most recent first (supports prerelease semver)."""
+    apps_dir = os.path.join(BASE, "apps")
+    out = []
+    pat = re.compile(
+        rf"^{re.escape(name)}-{_RE_SEMVER}-[0-9a-f]{{16}}\.tar\.zst$")
+    for x in os.listdir(apps_dir):
+        if pat.match(x):
+            out.append(x)
+    return sorted(out,
+                  key=lambda x: os.path.getmtime(os.path.join(apps_dir, x)),
+                  reverse=True)
+
+def _cmd_snapshot_locked(args):
+    name = args.name
+    try:
+        _validate_basename(name, "app name")
+    except ValueError as e:
+        print(f"ERROR: {e}"); return False
+    cfg_path = os.path.join(BASE, "apps", f"{name}.toml")
+    if not os.path.exists(cfg_path):
+        print(f"ERROR {cfg_path}"); return False
+    cfg = load_toml(cfg_path)
+    live = os.path.join(OPT, name)
+    if not os.path.exists(live):
+        print(f"ERROR live {live}"); return False
+    real = os.path.realpath(live)
+    ver = args.version if args.version else cfg.get("app", {}).get("version", "1.0.0")
+    # [version-drift] Prefer the version the installed binary actually
+    # reports over the stale manifest version. A native updater replaces
+    # the binary in place; without this the new binary would be packed
+    # under the OLD version string, producing a mislabeled artifact.
+    if not args.version:
+        detected = detect_binary_version(cfg, name)
+        if detected and detected != ver:
+            print(f"[snapshot] version drift: manifest says {ver}, binary reports {detected}")
+            ver = detected
+    h = sha16_of_dir(real, hash_excludes(cfg))
+    fname = f"{name}-{ver}-{h}.tar.zst"
+    out = os.path.join(BASE, "apps", fname)
+    if os.path.exists(out) and cfg.get("artifact", {}).get("file") == fname:
+        print(f"[snapshot] already up to date: {fname}")
+        return _reconcile_after_snapshot(name, cfg, fname, ver, out)
+    print(f"[snapshot] {name} -> {fname}")
+    t0 = time.time()
+    # [atomic-write] Pack into a temp file on Drive and rename it into
+    # place, so an interrupted snapshot never leaves a corrupt artifact
+    # under the expected name.
+    tmp_out = out + ".tmp"
+    try:
+        os.unlink(tmp_out)
+    except OSError:
+        pass
+    res = subprocess.run(["tar", "-I", f"zstd {ZSTD_COMPRESS} -T0", "-cf", tmp_out, "-C", real,
+                          "--sort=name", "."])
+    if res.returncode != 0:
+        print("ERROR tar")
+        try: os.unlink(tmp_out)
+        except OSError: pass
+        return False
+    os.replace(tmp_out, out)
+    print(f"[snapshot] packed in {time.time()-t0:.1f}s ({os.path.getsize(out)/(1024*1024):.1f} MiB)")
+    digest = sha256_of_file(out)
+    return _reconcile_after_snapshot(name, cfg, fname, ver, out, digest)
+
+def _reconcile_after_snapshot(name, cfg, fname, ver, out, digest=None):
+    """Make the live installation agree with the new artifact.
+
+    [snapshot-reconcile] A snapshot used to update only the manifest,
+    leaving /opt/colabos/<name> pointing at the OLD store directory and
+    the new store path missing. Doctor then reported the app as not
+    extracted until a separate bootstrap ran. Now the store directory is
+    renamed to the new content-addressed stem, the live symlink and the
+    binary links are repointed, and the lifecycle hook is re-run.
+    """
+    cfg_path = os.path.join(BASE, "apps", f"{name}.toml")
+    live = os.path.join(OPT, name)
+    real = os.path.realpath(live) if os.path.exists(live) else None
+    new_store = os.path.join(STORE_OPT, fname[:-len(".tar.zst")])
+    old_store = real
+    old_artifact = cfg.get("artifact", {}).get("file", "")
+
+    # 1. Move the live tree to its new content-addressed name.
+    if old_store and os.path.isdir(old_store):
+        if os.path.abspath(old_store) != os.path.abspath(new_store):
+            if os.path.exists(new_store):
+                shutil.rmtree(new_store, ignore_errors=True)
+            os.rename(old_store, new_store)
+            print(f"[snapshot] store {os.path.basename(old_store)} -> {os.path.basename(new_store)}")
+            old_store = new_store
+        else:
+            old_store = new_store
+    # 2. Repoint the live symlink atomically.
+    if os.path.exists(live) and not os.path.islink(live):
+        shutil.rmtree(live, ignore_errors=True)
+    if os.path.isdir(new_store):
+        _atomic_symlink(new_store, live)
+
+    # 3. Rewrite the manifest (atomically) with the new artifact.
+    cfg.setdefault("app", {})["version"] = ver
+    cfg["app"]["schema_version"] = cfg["app"].get("schema_version", SCHEMA_VERSION)
+    cfg.setdefault("artifact", {})["file"] = fname
+    if digest is None:
+        digest = sha256_of_file(out)
+    cfg["artifact"]["sha256"] = digest
+    save_toml(cfg_path, cfg)
+    print(f"[snapshot] updated {cfg_path} (sha256={digest[:16]}...)")
+
+    # 4. Relink binaries strictly and re-run the lifecycle hook.
+    cfg = load_toml(cfg_path)
+    bins = cfg.get("artifact", {}).get("bins", [])
+    linked = 0
+    for b in bins:
+        srcb = find_bin(live, b)
+        if not srcb:
+            print(f"[snapshot] ERROR: declared binary '{b}' not found in {live}")
+            return False
+        dst = os.path.join(BIN_DIR, b)
+        _atomic_symlink(srcb, dst)
+        linked += 1
+    print(f"[snapshot] relinked {linked} binary link(s)")
+
+    setup = os.path.join(BASE, "apps", f"{name}.sh")
+    if not os.path.exists(setup):
+        setup = os.path.join(BASE, "apps", "setup_" + name + ".sh")
+    if os.path.exists(setup):
+        r = subprocess.run(["bash", setup])
+        if r.returncode != 0:
+            print(f"ERROR: lifecycle hook for {name} exited {r.returncode} after snapshot")
+            return False
+        print(f"[snapshot] lifecycle hook ok")
+
+    # 5. Prune old artifacts: keep exactly the current one plus one prior.
+    # [prune-exact] Retention is exact and app-scoped.
+    files = _artifact_files(name)
+    keep = {fname}
+    for f in files:
+        if len(keep) >= 2:
+            break
+        if f != fname:
+            keep.add(f)
+    for f in files:
+        if f in keep:
+            continue
+        try:
+            os.remove(os.path.join(BASE, "apps", f))
+            print(f"[prune] {f}")
+        except OSError:
+            pass
+    # Remove any store directory for THIS app only (anchored version+hash regex).
+    keep_stems = {f[:-len(".tar.zst")] for f in keep}
+    store_pat = re.compile(rf"^{re.escape(name)}-{_RE_SEMVER}-[0-9a-f]{{16}}$")
+    if os.path.isdir(STORE_OPT):
+        for entry in os.listdir(STORE_OPT):
+            d = os.path.join(STORE_OPT, entry)
+            if store_pat.match(entry) and entry not in keep_stems and os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"[prune] store {entry}")
+    return True
+
+# --------------------------------------------------------------------------- #
+# Bootstrap (fast-path)                                                        #
+# --------------------------------------------------------------------------- #
+def cmd_bootstrap(args):
+    fd = acquire_lock()
+    try:
+        os.makedirs(OPT, exist_ok=True)
+        os.makedirs(STORE_OPT, exist_ok=True)
+        _install_svc_shim()
+        # Fast path: if every doctor check already passes, skip reinstall/relink
+        # work. This is the common warm-boot case.
+        #
+        # The fast path uses a SHALLOW doctor (deep=False): the content-hash
+        # comparison hashes every store tree and would cost ~25 s, blowing
+        # the warm-boot budget (<0.4 s). An explicit `svc doctor` still runs
+        # the deep check.
+        t0 = time.time()
+        if cmd_doctor(argparse.Namespace(fix=False, deep=False)):
+            # Ensure profile + motd are up to date even on fast path (cheap)
+            write_profile()
+            dt = time.time() - t0
+            print(f"[svc] boot complete in {dt:.2f}s (warm, fast-path)")
+            return
+        print("[svc] doctor reported issues; running full bootstrap...")
+        apps = get_apps()
+        # [depends-strict] A missing dependency or a cycle is a hard
+        # error: silently downgrading the order would start a dependent
+        # app before (or without) its dependency.
+        try:
+            levels = install_levels(apps, strict=True)
+        except ValueError as e:
+            print(f"[svc] FATAL: invalid dependency graph: {e}")
+            sys.exit(1)
+        total = sum(len(l) for l in levels)
+        print(f"[svc] bootstrap ColabOS v{VERSION} ({total} app(s) in {len(levels)} dependency level(s)) on {BASE}")
+        # Install one dependency level at a time. An app only starts once
+        # every app it depends_on has installed AND its lifecycle hook has
+        # returned successfully. Previously every app was submitted to one
+        # shared thread pool, which discarded the topological order.
+        for li, level in enumerate(levels):
+            # install_levels() returns a list of LISTS OF NAMES.
+            names = list(level)
+            if li:
+                print(f"[svc] dependency level {li}: {', '.join(names)}")
+            with ThreadPoolExecutor(max_workers=max(1, min(3, len(names)))) as ex:
+                futs = {ex.submit(install_app, n, quiet=False): n for n in names}
+                failed = []
+                for fut in as_completed(futs):
+                    n = futs[fut]
+                    try:
+                        if not fut.result():
+                            failed.append(n)
+                    except Exception as e:
+                        print(f"[svc] FATAL: exception installing {n}: {e}")
+                        failed.append(n)
+                if failed:
+                    for n in failed:
+                        print(f"[svc] FATAL: install failed for {n}")
+                    sys.exit(1)
+        write_profile()
+        dt = time.time() - t0
+        print(f"[svc] boot complete in {dt:.2f}s ({'warm' if dt < 2 else 'cold'})")
+        print("[svc] doctor: run 'svc doctor' to verify everything")
+    finally:
+        try: fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError: pass
+        fd.close()
+
+# --------------------------------------------------------------------------- #
+# Main                                                                         #
+# --------------------------------------------------------------------------- #
+def main():
+    p = argparse.ArgumentParser(description=f"ColabOS svc v{VERSION}")
+    p.add_argument("--version", action="version", version=f"ColabOS svc v{VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("bootstrap")
+    d = sub.add_parser("doctor"); d.add_argument("--fix", action="store_true")
+    l = sub.add_parser("list")
+    l.add_argument("-m", "--markdown", action="store_true", help="output as markdown table")
+    s = sub.add_parser("install"); s.add_argument("name")
+    s.add_argument("--force", action="store_true",
+                   help="re-extract the artifact even if the store directory exists")
+    s = sub.add_parser("snapshot"); s.add_argument("name"); s.add_argument("--version")
+    s = sub.add_parser("status"); s.add_argument("name", nargs="?")
+    s.add_argument("-m", "--markdown", action="store_true", help="output as markdown table")
+    dt = sub.add_parser("doc-table", help="generate markdown state table of all apps")
+    dt.add_argument("--json", action="store_true", help="output as JSON instead of Markdown")
+    s = sub.add_parser("logs"); s.add_argument("name")
+    s.add_argument("-n","--lines", type=int, default=40, help="lines to show (default 40)")
+    s.add_argument("--no-follow", action="store_true", help="print and exit (don't tail -f)")
+    args = p.parse_args()
+
+    if args.cmd == "bootstrap": cmd_bootstrap(args)
+    elif args.cmd == "doctor":  sys.exit(0 if cmd_doctor(args) else 1)
+    elif args.cmd == "list":    cmd_list(args)
+    elif args.cmd == "install": cmd_install(args)
+    elif args.cmd == "snapshot":cmd_snapshot(args)
+    elif args.cmd == "status":  cmd_status(args)
+    elif args.cmd == "doc-table": cmd_doc_table(args)
+    elif args.cmd == "logs":    cmd_logs(args)
+    else: p.print_help()
+
+if __name__ == "__main__":
+    main()

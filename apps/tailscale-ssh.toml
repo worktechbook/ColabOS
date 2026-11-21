@@ -1,0 +1,24 @@
+[app]
+name = "tailscale-ssh"
+version = "1.2.3"
+type = "server"
+description = "Key-only SSH over Tailscale mesh - permanent node colabos-node"
+schema_version = "1"
+
+[artifact]
+# Filename 16-hex suffix is the deterministic content-tree hash; sha256 is the compressed .tar.zst digest.
+file = "tailscale-ssh-1.2.3-1d324134bdbbe442.tar.zst"
+sha256 = "93d4e6407b8b8cf467118045d066d4a0b23fe6dd7191d1a241ac9ef5f2f1f28d"
+bins = ["tailscale", "tailscaled"]
+
+[persist]
+"home/tailscale-ssh/tailscale" = "/var/lib/tailscale"
+"home/tailscale-ssh/keys" = "/root/.ssh/keys_backup"
+
+[expose]
+port = "22"
+mode = "tailnet"
+health = "tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 2>/dev/null | grep -q '^100\\.' && tailscale --socket=/var/run/tailscale/tailscaled.sock serve status 2>/dev/null | grep -q '127.0.0.1:22' && ss -tln 'sport = :22' 2>/dev/null | grep -q LISTEN"
+
+[env]
+TAILSCALE_HOSTNAME = "colabos-node"
